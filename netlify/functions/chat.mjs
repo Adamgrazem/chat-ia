@@ -1,45 +1,91 @@
 
-const API = 'https://generativelanguage.googleapis.com/v1beta';
-const preferred = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
+const API = "https://generativelanguage.googleapis.com/v1beta";
 
-const json = (body, status = 200) => new Response(JSON.stringify(body), {
-  status,
-  headers: {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store'
-  }
-});
-
-async function getModels(key, signal) {
-  const response = await fetch(`${API}/models?pageSize=100`, {
-    headers: { 'x-goog-api-key': key },
-    signal
+const json = (body, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
   });
 
-  if (!response.ok) {
-    console.error('Gemini models list HTTP', response.status);
-    return { status: response.status, models: [] };
+const preferredModels = [
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-flash-latest"
+];
+
+async function googleRequest(url, key, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "x-goog-api-key": key,
+      ...(options.headers || {})
+    }
+  });
+
+  let data = {};
+  try {
+    data = await response.json();
+  } catch {}
+
+  return {
+    status: response.status,
+    ok: response.ok,
+    data
+  };
+}
+
+async function findModels(key, signal) {
+  const result = await googleRequest(
+    `${API}/models?pageSize=100`,
+    key,
+    { signal }
+  );
+
+  if (!result.ok) {
+    return {
+      error: result.data.error?.message ||
+        `Erreur Google HTTP ${result.status}`,
+      status: result.status,
+      models: []
+    };
   }
 
-  const data = await response.json();
+  const models = (result.data.models || [])
+    .filter(model =>
+      model.supportedGenerationMethods?.includes("generateContent")
+    )
+    .map(model => model.name.replace(/^models\//, ""));
+
+  const ordered = [
+    ...preferredModels.filter(name => models.includes(name)),
+    ...models.filter(name =>
+      name.startsWith("gemini-") &&
+      name.includes("flash") &&
+      !preferredModels.includes(name)
+    )
+  ];
 
   return {
     status: 200,
-    models: (data.models || [])
-      .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
-      .map(m => m.name.replace(/^models\//, ''))
+    models: [...new Set(ordered)]
   };
 }
 
 export default async function handler(request) {
-  if (request.method !== 'POST') {
-    return json({ error: 'Méthode non autorisée.' }, 405);
+  if (request.method !== "POST") {
+    return json({ error: "Méthode non autorisée." }, 405);
   }
 
   const key = process.env.GEMINI_API_KEY;
 
   if (!key) {
-    return json({ error: 'Clé GEMINI_API_KEY non configurée sur Netlify.' }, 503);
+    return json({
+      error: "Clé GEMINI_API_KEY absente dans Netlify."
+    }, 503);
   }
 
   let body;
@@ -47,145 +93,181 @@ export default async function handler(request) {
   try {
     body = await request.json();
   } catch {
-    return json({ error: 'Format JSON invalide.' }, 400);
+    return json({ error: "Message JSON invalide." }, 400);
   }
 
   if (
     !Array.isArray(body.messages) ||
-    body.messages.length < 1 ||
+    body.messages.length === 0 ||
     body.messages.length > 30
   ) {
-    return json({ error: 'Conversation invalide.' }, 400);
+    return json({ error: "Conversation invalide." }, 400);
   }
 
-  const messages = body.messages.map(m => ({
-    role: m.role === 'user' ? 'user' : m.role === 'ai' ? 'model' : 'invalid',
+  const messages = body.messages.map(message => ({
+    role:
+      message.role === "user" ? "user" :
+      message.role === "ai" ? "model" :
+      "invalid",
     parts: [{
-      text: typeof m.text === 'string' ? m.text.slice(0, 4000) : ''
+      text: typeof message.text === "string"
+        ? message.text.slice(0, 4000)
+        : ""
     }]
   }));
 
   if (
-    messages.some(m => m.role === 'invalid' || !m.parts[0].text.trim()) ||
-    messages.at(-1).role !== 'user'
+    messages.some(message =>
+      message.role === "invalid" ||
+      !message.parts[0].text.trim()
+    ) ||
+    messages[messages.length - 1].role !== "user"
   ) {
-    return json({ error: 'Messages invalides.' }, 400);
+    return json({ error: "Messages invalides." }, 400);
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    25000
+  );
 
   try {
-    const available = await getModels(key, controller.signal);
-
-    if (available.status === 401 || available.status === 403) {
-      return json({
-        error: 'Clé Gemini refusée. Vérifie la clé et les restrictions du projet Google.'
-      }, 502);
-    }
-
-    if (available.status === 429) {
-      return json({ error: 'Limite Gemini atteinte. Réessaie plus tard.' }, 429);
-    }
-
-    if (available.status !== 200) {
-      return json({
-        error: `Impossible de vérifier les modèles Gemini (HTTP ${available.status}).`
-      }, 502);
-    }
-
-    const selected =
-      preferred.find(name => available.models.includes(name)) ||
-      available.models.find(name => /^gemini-/.test(name) && /flash/.test(name)) ||
-      available.models.find(name => /^gemini-/.test(name));
-
-    if (!selected) {
-      return json({
-        error: 'Aucun modèle Gemini compatible avec generateContent disponible pour cette clé.'
-      }, 502);
-    }
-
-    const response = await fetch(
-      `${API}/models/${encodeURIComponent(selected)}:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          'x-goog-api-key': key,
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{
-              text: 'Tu es Chat IA, un assistant utile, clair, chaleureux et honnête. Réponds principalement en français.'
-            }]
-          },
-          contents: messages,
-          generationConfig: { maxOutputTokens: 1600 }
-        }),
-        signal: controller.signal
-      }
+    const available = await findModels(
+      key,
+      controller.signal
     );
 
-    if (!response.ok) {
-      let detail = '';
-
-      try {
-        detail = (await response.json()).error?.message || '';
-      } catch {}
-
+    if (available.status !== 200) {
       console.error(
-        'Gemini generateContent HTTP',
-        response.status,
-        'model',
-        selected,
-        detail.slice(0, 400)
+        "Gemini model listing:",
+        available.status,
+        available.error
       );
 
-      if (response.status === 429) {
+      return json({
+        error:
+          available.status === 429
+            ? "Quota Gemini atteint. Réessaie plus tard."
+            : available.status === 401 ||
+              available.status === 403
+            ? "Clé Gemini refusée ou accès interdit."
+            : `Impossible de récupérer les modèles Gemini (HTTP ${available.status}).`
+      }, available.status === 429 ? 429 : 502);
+    }
+
+    if (!available.models.length) {
+      return json({
+        error: "Aucun modèle Gemini Flash disponible avec cette clé."
+      }, 502);
+    }
+
+    let lastError = "";
+
+    for (const model of available.models.slice(0, 5)) {
+      const result = await googleRequest(
+        `${API}/models/${model}:generateContent`,
+        key,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [{
+                text:
+                  "Tu es Chat IA, un assistant intelligent, " +
+                  "clair, utile et chaleureux. " +
+                  "Réponds principalement en français."
+              }]
+            },
+            contents: messages,
+            generationConfig: {
+              maxOutputTokens: 2048
+            }
+          }),
+          signal: controller.signal
+        }
+      );
+
+      if (result.ok) {
+        const reply = result.data.candidates?.[0]
+          ?.content?.parts
+          ?.filter(part => typeof part.text === "string")
+          .map(part => part.text)
+          .join("\n")
+          .trim();
+
+        if (reply) {
+          return json({ reply });
+        }
+
+        lastError = "Gemini n'a généré aucun texte.";
+        continue;
+      }
+
+      lastError =
+        result.data.error?.message ||
+        `Erreur HTTP ${result.status}`;
+
+      console.error(
+        "Gemini:",
+        model,
+        "HTTP",
+        result.status,
+        lastError.slice(0, 500)
+      );
+
+      if (result.status === 404) {
+        continue;
+      }
+
+      if (result.status === 429) {
         return json({
-          error: 'Quota Gemini atteint. Réessaie plus tard ou vérifie ton quota gratuit.'
+          error:
+            "Quota Gemini atteint ou offre gratuite indisponible. " +
+            "Vérifie les quotas de ton projet Google AI Studio."
         }, 429);
       }
 
-      if (response.status === 401 || response.status === 403) {
+      if (
+        result.status === 401 ||
+        result.status === 403
+      ) {
         return json({
-          error: 'Accès Gemini refusé. Vérifie les autorisations de ta clé API.'
-        }, 502);
-      }
-
-      if (response.status === 404) {
-        return json({
-          error: `Modèle ${selected} introuvable ou indisponible. Consulte les logs Netlify.`
+          error:
+            "Google refuse l'accès. Vérifie la clé Gemini " +
+            "et les autorisations du projet."
         }, 502);
       }
 
       return json({
-        error: `Gemini a renvoyé une erreur HTTP ${response.status}. Consulte les logs Netlify.`
+        error:
+          `Erreur Gemini HTTP ${result.status}. ` +
+          "Consulte les logs Netlify pour le détail."
       }, 502);
     }
 
-    const data = await response.json();
-
-    const reply = data.candidates?.[0]?.content?.parts
-      ?.filter(p => typeof p.text === 'string')
-      .map(p => p.text)
-      .join('\n');
-
-    if (!reply?.trim()) {
-      return json({
-        error: 'Gemini n’a pas généré de texte. Réessaie.'
-      }, 502);
-    }
-
-    return json({ reply });
-
-  } catch (error) {
-    console.error('Gemini function', error?.name || 'Error');
+    console.error("Gemini final error:", lastError);
 
     return json({
-      error: error?.name === 'AbortError'
-        ? 'Gemini met trop de temps à répondre.'
-        : 'Erreur de connexion à Gemini.'
+      error:
+        "Aucun modèle Gemini essayé n'a répondu. " +
+        "Consulte les logs Netlify pour le détail."
+    }, 502);
+
+  } catch (error) {
+    console.error(
+      "Gemini function error:",
+      error?.message || error
+    );
+
+    return json({
+      error:
+        error?.name === "AbortError"
+          ? "Gemini met trop de temps à répondre."
+          : "Erreur de connexion au service Gemini."
     }, 502);
 
   } finally {
@@ -193,4 +275,6 @@ export default async function handler(request) {
   }
 }
 
-export const config = { path: '/api/chat' };
+export const config = {
+  path: "/api/chat"
+};
